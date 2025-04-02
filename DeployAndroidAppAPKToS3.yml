@@ -1,0 +1,79 @@
+name: Deploy Release
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [ closed ]
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    environment:
+      name: RELEASE
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Set properties
+        run: |
+          echo ACCESS_KEY=${{ secrets.ACCESS_KEY }} >> ./local.properties
+          echo SECRET_ACCESS_KEY=${{ secrets.SECRET_ACCESS_KEY }} >> ./local.properties
+          echo DIRECTORY_NAME=${{ secrets.DIRECTORY_NAME }} >> ./local.properties
+          echo RELEASE_BUCKET_NAME=${{ secrets.BUCKET_NAME }} >> ./local.properties
+          echo RELEASE_BUCKET_BASE_URL=${{ secrets.BUCKET_BASE_URL }} >> ./local.properties
+
+      - name: Set Amplify configuration
+        env:
+          JSON_DECODE: ${{ secrets.AMPLIFY_CONFIGURATION_BASE64_ENCODE }}
+        run: |
+          echo $JSON_DECODE | base64 --decode > app/src/main/res/raw/amplifyconfiguration.json
+
+      - name: Build with Gradle
+        run: ./gradlew assembleRelease
+
+      - name: Set APP VERSION
+        id: app_version
+        run: |
+          VERSION=$(grep -Eo 'versionName ".*"' ./app/build.gradle | grep -Eo '[0-9]+.[0-9]+.[0-9]+')
+          echo APP_VERSION=$VERSION >> $GITHUB_OUTPUT
+
+      - name: Zipalign
+        run: |
+          $ANDROID_SDK_ROOT/build-tools/34.0.0/zipalign -f -v 4 app/build/outputs/apk/release/app-release-unsigned.apk app/build/outputs/apk/release/app-release-zipalign.apk
+
+      - name: Decode Keystore
+        env:
+          KEY_STORE_DECODE: ${{ secrets.KEY_STORE_BASE64_ENCODE }}
+        run: |
+          echo $KEY_STORE_DECODE | base64 --decode > keystore.jks
+
+      - name: Verify APK signature
+        run: |
+          $ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner sign --ks keystore.jks -v --v2-signing-enabled true --ks-key-alias ${{ secrets.KEY_STORE_ALIAS }} --ks-pass pass:${{ secrets.KEY_STORE_PASSWORD }} app/build/outputs/apk/release/app-release-zipalign.apk
+          mv app/build/outputs/apk/release/app-release-zipalign.apk app/build/outputs/apk/release/app-${{ steps.app_version.outputs.APP_VERSION }}.apk
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
+
+      - name: Upload file to S3
+        run: |
+          aws s3 cp app/build/outputs/apk/release/app-${{ steps.app_version.outputs.APP_VERSION }}.apk s3://${{ secrets.BUCKET_NAME }}/{-------ServiceName-----}_apks/
+
+      - name: Upload apk file
+        uses: actions/upload-artifact@v4
+        with:
+          name: android release apk file
+          path: app/build/outputs/apk/release/app-${{ steps.app_version.outputs.APP_VERSION }}.apk
